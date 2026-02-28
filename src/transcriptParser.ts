@@ -17,6 +17,18 @@ import {
 
 export const PERMISSION_EXEMPT_TOOLS = new Set(['Task', 'AskUserQuestion']);
 
+// ── Codex tool name mapping ─────────────────────────────────
+// Codex uses different tool names; map common ones to our display format
+const CODEX_TOOL_NAME_MAP: Record<string, string> = {
+	'shell': 'Bash',
+	'read_file': 'Read',
+	'write_file': 'Write',
+	'edit_file': 'Edit',
+	'list_directory': 'Glob',
+	'search': 'Grep',
+	'web_search': 'WebSearch',
+};
+
 export function formatToolStatus(toolName: string, input: Record<string, unknown>): string {
 	const base = (p: unknown) => typeof p === 'string' ? path.basename(p) : '';
 	switch (toolName) {
@@ -52,6 +64,18 @@ export function processTranscriptLine(
 ): void {
 	const agent = agents.get(agentId);
 	if (!agent) return;
+
+	// Route to CLI-specific parser
+	if (agent.cliType === 'codex') {
+		processCodexTranscriptLine(agentId, line, agents, waitingTimers, permissionTimers, webview);
+		return;
+	}
+	if (agent.cliType === 'gemini') {
+		processGeminiTranscriptLine(agentId, line, agents, waitingTimers, permissionTimers, webview);
+		return;
+	}
+	// cursor has no file transcripts, so this won't be called for cursor agents
+	// Default: Claude format
 	try {
 		const record = JSON.parse(line);
 
@@ -295,5 +319,224 @@ function processProgressRecord(
 		if (stillHasNonExempt) {
 			startPermissionTimer(agentId, agents, permissionTimers, PERMISSION_EXEMPT_TOOLS, webview);
 		}
+	}
+}
+
+// ── Codex Transcript Parser ─────────────────────────────────
+// Codex JSONL uses event_msg wrappers. Key event types:
+// - response_item with tool_call / tool_result / message payloads
+// - turn.completed (turn end signal)
+// - user_message (new user prompt)
+
+function processCodexTranscriptLine(
+	agentId: number,
+	line: string,
+	agents: Map<number, AgentState>,
+	waitingTimers: Map<number, ReturnType<typeof setTimeout>>,
+	permissionTimers: Map<number, ReturnType<typeof setTimeout>>,
+	webview: vscode.Webview | undefined,
+): void {
+	const agent = agents.get(agentId);
+	if (!agent) return;
+	try {
+		const record = JSON.parse(line);
+		const eventType = record.type as string | undefined;
+
+		// Handle event_msg wrapper format
+		const payload = record.payload || record;
+		const payloadType = payload.type as string | undefined;
+
+		if (eventType === 'response_item' || payloadType === 'response_item') {
+			const item = payload.item || payload;
+			const itemType = item.type as string | undefined;
+
+			if (itemType === 'tool_call' || itemType === 'function_call') {
+				// Tool start
+				cancelWaitingTimer(agentId, waitingTimers);
+				agent.isWaiting = false;
+				agent.hadToolsInTurn = true;
+				webview?.postMessage({ type: 'agentStatus', id: agentId, status: 'active' });
+
+				const callId = item.call_id || item.id || crypto.randomUUID();
+				const rawName = item.name || item.function?.name || 'unknown';
+				const toolName = CODEX_TOOL_NAME_MAP[rawName] || rawName;
+				const input = item.arguments ? (typeof item.arguments === 'string' ? JSON.parse(item.arguments) : item.arguments) : {};
+				const status = formatToolStatus(toolName, input);
+
+				console.log(`[Pixel Agents] Agent ${agentId} (codex) tool start: ${callId} ${status}`);
+				agent.activeToolIds.add(callId);
+				agent.activeToolStatuses.set(callId, status);
+				agent.activeToolNames.set(callId, toolName);
+
+				if (!PERMISSION_EXEMPT_TOOLS.has(toolName)) {
+					startPermissionTimer(agentId, agents, permissionTimers, PERMISSION_EXEMPT_TOOLS, webview);
+				}
+
+				webview?.postMessage({
+					type: 'agentToolStart',
+					id: agentId,
+					toolId: callId,
+					status,
+				});
+			} else if (itemType === 'tool_result' || itemType === 'function_call_output') {
+				// Tool done
+				const callId = item.call_id || item.id || '';
+				if (callId && agent.activeToolIds.has(callId)) {
+					console.log(`[Pixel Agents] Agent ${agentId} (codex) tool done: ${callId}`);
+					agent.activeToolIds.delete(callId);
+					agent.activeToolStatuses.delete(callId);
+					agent.activeToolNames.delete(callId);
+					const toolId = callId;
+					setTimeout(() => {
+						webview?.postMessage({
+							type: 'agentToolDone',
+							id: agentId,
+							toolId,
+						});
+					}, TOOL_DONE_DELAY_MS);
+
+					if (agent.activeToolIds.size === 0) {
+						agent.hadToolsInTurn = false;
+					}
+				}
+			} else if (itemType === 'message' && !agent.hadToolsInTurn) {
+				// Text message — use text-idle timer
+				startWaitingTimer(agentId, TEXT_IDLE_DELAY_MS, agents, waitingTimers, webview);
+			}
+		} else if (eventType === 'turn.completed' || payloadType === 'turn.completed') {
+			// Definitive turn end
+			cancelWaitingTimer(agentId, waitingTimers);
+			cancelPermissionTimer(agentId, permissionTimers);
+
+			if (agent.activeToolIds.size > 0) {
+				agent.activeToolIds.clear();
+				agent.activeToolStatuses.clear();
+				agent.activeToolNames.clear();
+				agent.activeSubagentToolIds.clear();
+				agent.activeSubagentToolNames.clear();
+				webview?.postMessage({ type: 'agentToolsClear', id: agentId });
+			}
+
+			agent.isWaiting = true;
+			agent.permissionSent = false;
+			agent.hadToolsInTurn = false;
+			webview?.postMessage({
+				type: 'agentStatus',
+				id: agentId,
+				status: 'waiting',
+			});
+		} else if (eventType === 'user_message' || payloadType === 'user_message') {
+			// New user prompt — new turn
+			cancelWaitingTimer(agentId, waitingTimers);
+			clearAgentActivity(agent, agentId, permissionTimers, webview);
+			agent.hadToolsInTurn = false;
+		}
+	} catch {
+		// Ignore malformed lines (metadata headers, etc.)
+	}
+}
+
+// ── Gemini Transcript Parser ────────────────────────────────
+// Gemini uses monolithic JSON files (not JSONL). When the file changes,
+// we re-read and process only new messages. The fileWatcher sends us the
+// raw content. For Gemini, we treat the entire file as a single "line" to parse.
+//
+// Gemini session JSON structure:
+// { messages: [ { role: "user"|"model", parts: [ { text, functionCall, functionResponse } ] } ] }
+//
+// We track the message count and only process new messages.
+
+function processGeminiTranscriptLine(
+	agentId: number,
+	line: string,
+	agents: Map<number, AgentState>,
+	waitingTimers: Map<number, ReturnType<typeof setTimeout>>,
+	permissionTimers: Map<number, ReturnType<typeof setTimeout>>,
+	webview: vscode.Webview | undefined,
+): void {
+	const agent = agents.get(agentId);
+	if (!agent) return;
+	try {
+		const record = JSON.parse(line);
+
+		// Gemini session files may have various structures
+		// Try to identify tool calls in the content
+		const messages = record.messages || record.history || [];
+		if (!Array.isArray(messages)) return;
+
+		// We use fileOffset as a message index counter for Gemini
+		// (overloading the field since Gemini uses full re-reads)
+		const lastProcessed = agent.fileOffset;
+		if (messages.length <= lastProcessed) return;
+
+		// Process only new messages
+		for (let i = lastProcessed; i < messages.length; i++) {
+			const msg = messages[i];
+			const role = msg.role as string;
+			const parts = msg.parts || msg.content || [];
+
+			if (role === 'model' || role === 'gemini' || role === 'assistant') {
+				if (!Array.isArray(parts)) continue;
+				let hasToolCall = false;
+
+				for (const part of parts) {
+					if (part.functionCall) {
+						hasToolCall = true;
+						cancelWaitingTimer(agentId, waitingTimers);
+						agent.isWaiting = false;
+						agent.hadToolsInTurn = true;
+						webview?.postMessage({ type: 'agentStatus', id: agentId, status: 'active' });
+
+						const callId = part.functionCall.id || `gemini-${crypto.randomUUID()}`;
+						const rawName = part.functionCall.name || 'unknown';
+						const args = part.functionCall.args || {};
+						const status = formatToolStatus(rawName, args);
+
+						console.log(`[Pixel Agents] Agent ${agentId} (gemini) tool start: ${callId} ${status}`);
+						agent.activeToolIds.add(callId);
+						agent.activeToolStatuses.set(callId, status);
+						agent.activeToolNames.set(callId, rawName);
+
+						webview?.postMessage({
+							type: 'agentToolStart',
+							id: agentId,
+							toolId: callId,
+							status,
+						});
+
+						startPermissionTimer(agentId, agents, permissionTimers, PERMISSION_EXEMPT_TOOLS, webview);
+					} else if (part.functionResponse) {
+						const callId = part.functionResponse.id || '';
+						if (callId && agent.activeToolIds.has(callId)) {
+							agent.activeToolIds.delete(callId);
+							agent.activeToolStatuses.delete(callId);
+							agent.activeToolNames.delete(callId);
+							const toolId = callId;
+							setTimeout(() => {
+								webview?.postMessage({
+									type: 'agentToolDone',
+									id: agentId,
+									toolId,
+								});
+							}, TOOL_DONE_DELAY_MS);
+						}
+					}
+				}
+
+				if (!hasToolCall && !agent.hadToolsInTurn) {
+					startWaitingTimer(agentId, TEXT_IDLE_DELAY_MS, agents, waitingTimers, webview);
+				}
+			} else if (role === 'user') {
+				// New user prompt — new turn
+				cancelWaitingTimer(agentId, waitingTimers);
+				clearAgentActivity(agent, agentId, permissionTimers, webview);
+				agent.hadToolsInTurn = false;
+			}
+		}
+
+		// Update offset to track how many messages we've seen
+		agent.fileOffset = messages.length;
+	} catch {
+		// Ignore parse errors
 	}
 }

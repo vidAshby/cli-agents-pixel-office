@@ -2,9 +2,11 @@ import * as fs from 'fs';
 import * as path from 'path';
 import * as vscode from 'vscode';
 import type { AgentState } from './types.js';
+import type { CliType } from './cliProviders.js';
+import { getCliProviderByPrefix } from './cliProviders.js';
 import { cancelWaitingTimer, cancelPermissionTimer, clearAgentActivity } from './timerManager.js';
 import { processTranscriptLine } from './transcriptParser.js';
-import { FILE_WATCHER_POLL_INTERVAL_MS, PROJECT_SCAN_INTERVAL_MS } from './constants.js';
+import { FILE_WATCHER_POLL_INTERVAL_MS, PROJECT_SCAN_INTERVAL_MS, DEFAULT_CLI_TYPE } from './constants.js';
 
 export function startFileWatching(
 	agentId: number,
@@ -56,6 +58,13 @@ export function readNewLines(
 ): void {
 	const agent = agents.get(agentId);
 	if (!agent) return;
+
+	// Gemini uses monolithic JSON files — re-read entire file on change
+	if (agent.cliType === 'gemini') {
+		readGeminiFile(agentId, agent, agents, waitingTimers, permissionTimers, webview);
+		return;
+	}
+
 	try {
 		const stat = fs.statSync(agent.jsonlFile);
 		if (stat.size <= agent.fileOffset) return;
@@ -87,6 +96,40 @@ export function readNewLines(
 		}
 	} catch (e) {
 		console.log(`[Pixel Agents] Read error for agent ${agentId}: ${e}`);
+	}
+}
+
+/** Read Gemini's monolithic JSON session file and pass entire content as one parse unit */
+function readGeminiFile(
+	agentId: number,
+	agent: AgentState,
+	agents: Map<number, AgentState>,
+	waitingTimers: Map<number, ReturnType<typeof setTimeout>>,
+	permissionTimers: Map<number, ReturnType<typeof setTimeout>>,
+	webview: vscode.Webview | undefined,
+): void {
+	try {
+		const stat = fs.statSync(agent.jsonlFile);
+		// Check if file size changed (Gemini rewrites the whole file)
+		if (stat.size === agent.fileOffset && agent.lineBuffer === String(stat.mtimeMs)) return;
+
+		const content = fs.readFileSync(agent.jsonlFile, 'utf-8');
+		// Store mtime in lineBuffer to detect changes even when size is the same
+		agent.lineBuffer = String(stat.mtimeMs);
+
+		// Cancel timers — new data arriving
+		cancelWaitingTimer(agentId, waitingTimers);
+		cancelPermissionTimer(agentId, permissionTimers);
+		if (agent.permissionSent) {
+			agent.permissionSent = false;
+			webview?.postMessage({ type: 'agentToolPermissionClear', id: agentId });
+		}
+
+		// Pass entire JSON content as one "line" to the Gemini parser
+		// The parser will track message index internally via agent.fileOffset
+		processTranscriptLine(agentId, content, agents, waitingTimers, permissionTimers, webview);
+	} catch (e) {
+		console.log(`[Pixel Agents] Gemini read error for agent ${agentId}: ${e}`);
 	}
 }
 
@@ -194,6 +237,10 @@ function adoptTerminalForFile(
 	webview: vscode.Webview | undefined,
 	persistAgents: () => void,
 ): void {
+	// Try to detect CLI type from terminal name prefix
+	const detectedProvider = getCliProviderByPrefix(terminal.name);
+	const cliType: CliType = detectedProvider?.id || (DEFAULT_CLI_TYPE as CliType);
+
 	const id = nextAgentIdRef.current++;
 	const agent: AgentState = {
 		id,
@@ -210,14 +257,15 @@ function adoptTerminalForFile(
 		isWaiting: false,
 		permissionSent: false,
 		hadToolsInTurn: false,
+		cliType,
 	};
 
 	agents.set(id, agent);
 	activeAgentIdRef.current = id;
 	persistAgents();
 
-	console.log(`[Pixel Agents] Agent ${id}: adopted terminal "${terminal.name}" for ${path.basename(jsonlFile)}`);
-	webview?.postMessage({ type: 'agentCreated', id });
+	console.log(`[Pixel Agents] Agent ${id} (${cliType}): adopted terminal "${terminal.name}" for ${path.basename(jsonlFile)}`);
+	webview?.postMessage({ type: 'agentCreated', id, cliType });
 
 	startFileWatching(id, jsonlFile, agents, fileWatchers, pollingTimers, waitingTimers, permissionTimers, webview);
 	readNewLines(id, agents, waitingTimers, permissionTimers, webview);

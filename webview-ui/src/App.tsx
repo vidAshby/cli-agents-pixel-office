@@ -121,7 +121,12 @@ function App() {
 
   const isEditDirty = useCallback(() => editor.isEditMode && editor.isDirty, [editor.isEditMode, editor.isDirty])
 
-  const { agents, selectedAgent, agentTools, agentStatuses, subagentTools, subagentCharacters, layoutReady, loadedAssets, workspaceFolders } = useExtensionMessages(getOfficeState, editor.setLastSavedLayout, isEditDirty)
+  const { agents, selectedAgent, agentTools, agentStatuses, subagentTools, subagentCharacters, layoutReady, loadedAssets, workspaceFolders, selectedCli, setSelectedCli } = useExtensionMessages(getOfficeState, editor.setLastSavedLayout, isEditDirty)
+
+  const handleSelectedCliChange = useCallback((cli: string) => {
+    setSelectedCli(cli)
+    vscode.postMessage({ type: 'setSelectedCli', cliType: cli })
+  }, [setSelectedCli])
 
   const [isDebugMode, setIsDebugMode] = useState(false)
 
@@ -225,11 +230,12 @@ function App() {
 
       <BottomToolbar
         isEditMode={editor.isEditMode}
-        onOpenClaude={editor.handleOpenClaude}
         onToggleEditMode={editor.handleToggleEditMode}
         isDebugMode={isDebugMode}
         onToggleDebugMode={handleToggleDebugMode}
         workspaceFolders={workspaceFolders}
+        selectedCli={selectedCli}
+        onSelectedCliChange={handleSelectedCliChange}
       />
 
       {editor.isEditMode && editor.isDirty && (
